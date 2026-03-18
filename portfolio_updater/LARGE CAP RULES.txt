@@ -1,0 +1,29 @@
+Universe = $XJO.au
+DataGranularity = W
+MaxPositions = 15
+PositionSizeMethod = EqualWeight
+
+TurnoverFilter = 500000
+VolumeFilter = 500000
+
+IndexFilter = $XJO.au
+IndexFilterLength = 15
+
+HighLookback = 20
+LowLookback = 30
+IndexStopLookback = 2
+
+*Buy = Close >= 20W High
+AND IsInUniverse
+AND IndexFilter > IndexMovingAvg
+AND SevenDayAverageTurnover > 500000 
+AND SevenDayAverageLiquidity > 500000
+
+If( IndexFilter < IndexMovingAvg,
+	Sell = C <= 0.9 * 2W High,
+	Sell = C <= 30W Low
+)
+OR Removed From $XJO.au
+OR Delisted
+
+*If there are more stocks to Buy than there are open positions, sort using MomentumScore
