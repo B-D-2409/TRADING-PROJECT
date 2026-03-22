@@ -1,91 +1,190 @@
+#%%
+import math
 import pandas as pd
-from base_strategy import BaseStrategy  # This is the abstract base class
+from strategies.base_strategy import BaseStrategy
+from utils.data_factory import get_data
 
-from utils.equity import update_equity_curve, get_equity_value
-from utils.company_data import fundamental_data
-from utils.signals import process_signals
-from utils.trades import update_trade_list
-from utils.analytics import performance_analytics
-from utils.file_io import combine_data
-
-
+#%%
 class LargeCapStrategy(BaseStrategy):
-    def __init__(self, config, asof_date):
-        super().__init__(config, asof_date)
-        self.name = config["name"]
-        self.folder = f"{self.name}/live_sheets"
-        self.live_file = f"{self.name}/live_file/{self.asof_date}-data.xlsx"
+    """
+    Large Cap Strategy — ASX XJO universe (top 200 stocks by market cap).
 
-    def read_old_data(self):
-        def load(name): return pd.read_csv(f"{self.folder}/{self.prev_date}-{name}.csv")
-        self.old_data = {
-            "cip": load("companies_in_portfolio"),
-            "cp": load("company_page_data"),
-            "bs": load("buy_sell_alerts"),
-            "a": load("analytics"),
-            "ec": load("equity_curve"),
-            "t": load("trades"),
-        }
+    Max positions : 15
+    Sell (always) : current close ≤ 30-week rolling low             [Trend Stop]
+    Sell (index below SMA only):
+                    current close ≤ 30-week rolling low             [Trend Stop]
+                 OR current close ≤ 0.9 × 2-week high              [Momentum Stop]
+    Buy  (index above SMA, open slots exist):
+                    candidates supplied by external momentum scanner;
+                    sized at equal weight: portfolio_equity ÷ 15.
 
-    def calculate_equity(self):
-        self.equity_value = get_equity_value(self.old_data["t"], 0, self.asof_date)
+    Symbol conversion: Trades sheet codes end in '.ASX'; stripped to base + '.au'
+    before calling get_data (e.g. 'BHP.ASX' → 'BHP.au').
+    """
 
-    def update_equity_curve(self):
-        self.new_ec = update_equity_curve(self.old_data["ec"], self.equity_value, self.asof_date)
+    MAX_POSITIONS       = 15
+    SELL_LOW_WEEKS      = 30
+    SELL_HIGH_WEEKS     = 2
+    SELL_HIGH_THRESHOLD = 0.9
 
-    def generate_signals(self):
-        # Read config
-        c = self.config
-        self.activitydf, self.positions = process_signals(
-            strat_name=self.name,
-            index_sym=c["universe"],
-            frequency=c["freq"],
-            number_positions=c["number_positions"],
-            buy_lookback=next(cond["lookback_period"] for cond in c["buy_criteria"]["conditions"] if cond["type"] == "price_breakout"),
-            sma_period=next(cond["period"] for cond in c["buy_criteria"]["conditions"] if cond["type"] == "external_indicator"),
-            sell_lookback=next(c["sell_criteria"]["if_true"]["lookback_period"], 30),
-            sell_scale=-0.1,
-            index_sma=c["sell_criteria"]["condition_on"]["period"],
-            sell_short_lookback=c["sell_criteria"]["if_false"]["lookback_period"],
-            equity=self.equity_value,
-            prev_date=self.prev_date
+    def __init__(self, config: dict, asof_date: str):
+        super().__init__(config)
+        self.asof_date = asof_date
+
+    #%%
+    def check_for_sell_orders(
+        self,
+        trades_df: pd.DataFrame,
+        _: pd.DataFrame,
+        index_above_ma: bool,
+        next_monday_str: str,
+    ) -> tuple:
+        """
+        Evaluate stop conditions for every currently Open position.
+
+        Trend Stop    : close ≤ 30-week rolling low (fires regardless of index state).
+        Momentum Stop : close ≤ 0.9 × 2-week high  (fires only when index is below SMA).
+
+        Triggered rows are updated in-place:
+          Trade: → 'Sell'  |  Ex. Date: → next_monday_str
+          Ex. Price: / % chg: / Profit: / % Profit: → '-'
+        The actual exit price is filled by daily_workflow on next Monday's open.
+
+        Returns (updated_trades_df, sell_alerts_df).
+        """
+        asof     = self._asof_as_date()
+        min_bars = self.SELL_LOW_WEEKS + 1
+        sell_rows = []
+
+        for idx, row in trades_df[trades_df['Trade:'] == 'Open'].iterrows():
+            code   = str(row['Code:'])
+            ticker = code.split('.')[0] + '.au'
+
+            try:
+                price_df = get_data(ticker, ed=asof, freq='W')
+                if price_df is None or len(price_df) < min_bars:
+                    continue
+
+                current_close = float(price_df['Close'].iloc[-1])
+                n_week_low    = float(
+                    price_df['Low'].iloc[-(self.SELL_LOW_WEEKS + 1):-1].min()
+                )
+                two_week_high = float(
+                    price_df['High'].iloc[-self.SELL_HIGH_WEEKS:].max()
+                )
+
+                trend_stop_hit    = current_close <= n_week_low
+                momentum_stop_hit = (not index_above_ma) and (
+                    current_close <= self.SELL_HIGH_THRESHOLD * two_week_high
+                )
+
+                if not (trend_stop_hit or momentum_stop_hit):
+                    continue
+
+                stop_type = 'Trend Stop' if trend_stop_hit else 'Momentum Stop'
+
+                trades_df.at[idx, 'Trade:']     = 'Sell'
+                trades_df.at[idx, 'Ex. Date:']  = next_monday_str
+                trades_df.at[idx, 'Ex. Price:'] = '-'
+                trades_df.at[idx, '% chg:']     = '-'
+                trades_df.at[idx, 'Profit:']    = '-'
+                trades_df.at[idx, '% Profit:']  = '-'
+
+                sell_rows.append({
+                    'Code:':      code,
+                    'Action:':    'SELL',
+                    'Stop Type:': stop_type,
+                    'Date:':      next_monday_str,
+                })
+
+            except Exception:
+                continue
+
+        sell_alerts_df = (
+            pd.DataFrame(sell_rows)
+            if sell_rows
+            else pd.DataFrame(columns=['Code:', 'Action:', 'Stop Type:', 'Date:'])
         )
+        return trades_df, sell_alerts_df
 
-    def update_portfolio(self):
-        self.new_tradelist = update_trade_list(self.old_data["t"], self.activitydf, self.new_ec, self.asof_date, self.config["number_positions"])
+    #%%
+    def check_for_buy_orders(
+        self,
+        trades_df: pd.DataFrame,
+        equity_df: pd.DataFrame,
+        index_above_ma: bool,
+        next_monday_str: str,
+    ) -> tuple:
+        """
+        Insert new Buy rows when the index filter is clear and the portfolio has capacity.
 
-    def calculate_analytics(self):
-        self.new_analytics = performance_analytics(self.new_ec, self.new_tradelist)
+        Position size = floor(portfolio_equity / MAX_POSITIONS / current_weekly_close).
+        Occupied slots = count of rows where Trade: is 'Open' or 'Buy'.
 
-    def get_company_data(self):
-        columns = [
-            "Name:", "Code:", "Sector:", "Last Price:", "52-Week High:", "52-Week Low:", "Market Cap:", "Franking Level:", "Business Summary:",
-            "P/E Ratio:", "Dividend Yield:", "P/S Ratio:", "P/FCF Ratio:",
-            "Net Debt:", "Debt-to-Equity Ratio:", "Current Ratio:", "Free Cash Flow:", "Net Profit Margin:",
-            "Revenue Growth (3-Year CAGR):", "EPS Growth (3-Year CAGR):", "ROE:"
-        ]
-        data = [fundamental_data(code) for code in self.positions["Code:"]]
-        self.new_cip = self.new_cp = pd.DataFrame(data, columns=columns)
+        new_buys_df is the integration point for the external momentum scanner.
+        Replace the pd.DataFrame() placeholder with the ranked candidate list
+        (must contain at minimum a 'Code:' column) to activate live buy signals.
 
-    def get_trade_alerts(self):
-        return self.activitydf
+        Returns (updated_trades_df, buy_alerts_df).
+        """
+        empty_alerts = pd.DataFrame(columns=['Code:', 'Action:', 'Date:'])
 
-    def save_all(self):
-        # Save each sheet
-        self.new_cip.to_csv(f"{self.folder}/{self.asof_date}-companies_in_portfolio.csv", index=False)
-        self.new_cp.to_csv(f"{self.folder}/{self.asof_date}-company_page_data.csv", index=False)
-        self.new_ec.to_csv(f"{self.folder}/{self.asof_date}-equity_curve.csv", index=False)
-        self.new_tradelist.to_csv(f"{self.folder}/{self.asof_date}-trades.csv", index=False)
-        self.activitydf.to_csv(f"{self.folder}/{self.asof_date}-buy_sell_alerts.csv", index=False)
-        self.new_analytics.to_csv(f"{self.folder}/{self.asof_date}-analytics.csv", header=False)
+        if not index_above_ma:
+            return trades_df, empty_alerts
 
-        # Final Excel export
-        combine_data(
-            self.live_file,
-            self.new_cip,
-            self.new_cp,
-            self.activitydf,
-            self.new_analytics,
-            self.new_ec,
-            self.new_tradelist
-        )
+        occupied        = int(trades_df['Trade:'].isin(['Open', 'Buy']).sum())
+        available_slots = self.MAX_POSITIONS - occupied
+        if available_slots <= 0:
+            return trades_df, empty_alerts
+
+        current_equity        = float(equity_df['Portfolio Equity:'].iloc[-1])
+        position_size_dollars = current_equity / self.MAX_POSITIONS
+
+        new_buys_df = pd.DataFrame()
+
+        if new_buys_df.empty:
+            return trades_df, empty_alerts
+
+        asof       = self._asof_as_date()
+        buy_rows   = []
+        alert_rows = []
+
+        for _, candidate in new_buys_df.head(available_slots).iterrows():
+            code   = str(candidate['Code:'])
+            ticker = code.split('.')[0] + '.au'
+
+            try:
+                price_df      = get_data(ticker, ed=asof, freq='W')
+                current_close = float(price_df['Close'].iloc[-1])
+                shares        = math.floor(position_size_dollars / current_close)
+                if shares == 0:
+                    continue
+
+                buy_rows.append({
+                    'Code:':      code,
+                    'Trade:':     'Buy',
+                    'Date:':      next_monday_str,
+                    'Price:':     '-',
+                    'Ex. Date:':  next_monday_str,
+                    'Ex. Price:': '-',
+                    '% chg:':     '-',
+                    'Profit:':    '-',
+                    '% Profit:':  '-',
+                    'Shares:':    float(shares),
+                })
+                alert_rows.append({
+                    'Code:':   code,
+                    'Action:': 'BUY',
+                    'Date:':   next_monday_str,
+                })
+
+            except Exception:
+                continue
+
+        if buy_rows:
+            trades_df = pd.concat(
+                [trades_df, pd.DataFrame(buy_rows)], ignore_index=True
+            )
+
+        buy_alerts_df = pd.DataFrame(alert_rows) if alert_rows else empty_alerts
+        return trades_df, buy_alerts_df

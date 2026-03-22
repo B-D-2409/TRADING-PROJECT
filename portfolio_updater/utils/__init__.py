@@ -14,6 +14,8 @@ __all__ = [
     "get_equity_value", "update_equity_curve",
     # company_data
     "nd_timeseries", "nd_div", "roundToTick", "orderPriceRounding", "fundamental_data",
+    # data_factory
+    "get_data", "get_dividend", "get_fundamentals",
     # signals
     "momentum_score", "process_signals",
     # trades
@@ -40,6 +42,11 @@ _exports = {
     "roundToTick": ("company_data", "roundToTick"),
     "orderPriceRounding": ("company_data", "orderPriceRounding"),
     "fundamental_data": ("company_data", "fundamental_data"),
+
+    # data_factory
+    "get_data": ("data_factory", "get_data"),
+    "get_dividend": ("data_factory", "get_dividend"),
+    "get_fundamentals": ("data_factory", "get_fundamentals"),
 
     # signals
     "momentum_score": ("signals", "momentum_score"),

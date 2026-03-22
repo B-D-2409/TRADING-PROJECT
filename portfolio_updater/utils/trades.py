@@ -1,32 +1,54 @@
 import pandas as pd
 import datetime
 import numpy as np
-from company_data import nd_timeseries
+from utils.company_data import nd_timeseries
 
 
-def update_trade_prices(df, cash, comms, end_date):
-    
-    entries = df[df['Price:']=='-']
-    exits = df[df['Ex. Price:']=='-']
+def update_trade_prices(trades_df, current_cash, commissions, target_date):
+    original_cols = trades_df.columns.tolist()
+    norm_cols = {c.replace(':', '').strip().lower(): c for c in original_cols}
 
-    if not entries.empty:
-        for index, row in entries:
-            symbol = row['Code:']
-            prices = nd_timeseries(symbol, 'D', end_date)
-            open_price = prices.iloc[-1]['Open']
-            cash -= row['Shares:'] * open_price - row['Shares:'] * open_price * comms
-            df.iloc[index, 'Price:'] = open_price
-    
-    if not exits.empty:
-        for index, row in entries:
-            symbol = row['Code:']
-            prices = nd_timeseries(symbol, 'D', end_date)
-            open_price = prices.iloc[-1]['Open']
-            cash += row['Shares:'] * open_price - row['Shares:'] * open_price * comms
-            df.iloc[index, 'Ex. Price:'] = open_price
-    
-    return df, cash
+    def get_c(key): return norm_cols.get(key.lower())
 
+    c_code = get_c('Code')
+    c_trade = get_c('Trade')
+    c_ex_price = get_c('Ex Price')
+    c_price = get_c('Price')
+    c_qty = get_c('Shares') if get_c('Shares') in trades_df.columns else get_c('Qty')
+    c_ex_date = get_c('Ex. Date')
+    c_sale_val = get_c('Sale value')
+
+    for idx, row in trades_df.iterrows():
+        symbol = str(row[c_code]).strip()
+        if symbol == '-' or not symbol: continue
+        
+        ticker = symbol.split('.')[0] + '.au'
+        price_data = nd_timeseries(ticker, target_date, 'D')
+        
+        if price_data is None or price_data.empty: continue
+        
+        open_price = price_data.iloc[-1]['Open']
+
+        if row[c_trade] == 'Sell' and row[c_ex_price] == '-':
+            trades_df.at[idx, c_ex_price] = open_price
+            if c_ex_date: trades_df.at[idx, c_ex_date] = target_date
+            
+            shares = float(row[c_qty])
+            sale_value = (shares * open_price) - commissions
+            if c_sale_val: trades_df.at[idx, c_sale_val] = sale_value
+            
+            current_cash += sale_value
+            trades_df.at[idx, c_trade] = 'Closed'
+
+        elif row[c_trade] == 'Buy' and row[c_price] == '-':
+            trades_df.at[idx, c_price] = open_price
+            
+            shares = float(row[c_qty])
+            buy_value = (shares * open_price) + commissions
+            current_cash -= buy_value
+            trades_df.at[idx, c_trade] = 'Open'
+            
+    return trades_df, current_cash
 
 def update_trade_list(tradelist, enddate, brokerage):
 
@@ -65,21 +87,13 @@ def update_trade_list(tradelist, enddate, brokerage):
 
 
 
-
-
-
-
-
-
-
-
 def update_trade_list_all(tradelist, activitydf, equitydf, enddate, numpos):
 
     brokerage = 0.001
     new_tradelist = tradelist.copy()
 
-    # check if any entry prices are to be confirmed and fill them in
-    missing_entry = new_tradelist[new_tradelist['Price:'].isnull()]
+    # Check if any entry prices are to be confirmed — sentinel is the string '-'
+    missing_entry = new_tradelist[new_tradelist['Price:']=='-']
     entry_prices = []
     for index, row in missing_entry.iterrows():
         prices = nd_timeseries(
@@ -96,8 +110,8 @@ def update_trade_list_all(tradelist, activitydf, equitydf, enddate, numpos):
     new_tradelist.loc[idx, 'Price:'] = entry_prices
     # new_tradelist.loc[idx, 'Price:'] = new_tradelist.loc[idx, 'Price:'].apply(orderPriceRounding)
 
-    # check if any exit prices are to be confirmed and fill them in
-    missing_exit = new_tradelist[new_tradelist['Ex. Price:'].isnull()]
+    # Check if any exit prices are to be confirmed — sentinel is the string '-'
+    missing_exit = new_tradelist[new_tradelist['Ex. Price:']=='-']
     exit_prices = []
     for index, row in missing_exit.iterrows():
         prices = nd_timeseries(
@@ -141,11 +155,11 @@ def update_trade_list_all(tradelist, activitydf, equitydf, enddate, numpos):
     new_tradelist.loc[idx, '% chg:'] = new_tradelist.loc[idx, '% chg:'].apply(lambda x: f"{round(x*100, 2)}%")
     new_tradelist.loc[idx, '% Profit:'] = new_tradelist.loc[idx, '% Profit:'].apply(lambda x: f"{round(x*100, 2)}%")
 
-    # change sold positions from open long to open and edit exit price to nan
+    # Change sold positions from Open Long to Long; reset exit price to '-' sentinel
     sold_sym = activitydf[activitydf['Action:']=='SELL']['Code:'].to_list()
     sol_pos = new_tradelist[(new_tradelist['Trade:']=='Open Long') & (new_tradelist['Code:'].isin(sold_sym))]
     idx = sol_pos.index.values
-    new_tradelist.loc[idx, 'Ex. Price:'] = np.nan
+    new_tradelist.loc[idx, 'Ex. Price:'] = '-'  # standardised sentinel
     new_tradelist.loc[idx, 'Trade:'] = 'Long'
 
     # add in new buys
@@ -165,17 +179,18 @@ def update_trade_list_all(tradelist, activitydf, equitydf, enddate, numpos):
         ns = (eq * w) / prices.iloc[-1]['Close']
         numshares.append(round(ns, 0))
 
+    # New buy rows use '-' as sentinel for prices not yet filled (standardised)
     buydf = pd.DataFrame(
         {
         'Code:':buy_sym,
         'Trade:':['Open Long'] * len(buy_sym),
         'Date:': [buydate_str] * len(buy_sym),
-        'Price:': [np.nan] * len(buy_sym),
+        'Price:': ['-'] * len(buy_sym),      # pending entry price
         'Ex. Date:': [buydate_str] * len(buy_sym),
-        'Ex. Price:': [np.nan] * len(buy_sym),
-        '% chg:': [np.nan] * len(buy_sym),
-        'Profit:': [np.nan] * len(buy_sym),
-        '% Profit:': [np.nan] * len(buy_sym),
+        'Ex. Price:': ['-'] * len(buy_sym),  # pending exit price
+        '% chg:': ['-'] * len(buy_sym),
+        'Profit:': ['-'] * len(buy_sym),
+        '% Profit:': ['-'] * len(buy_sym),
         'Shares:':numshares
     })
     

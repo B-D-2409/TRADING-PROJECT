@@ -1,68 +1,192 @@
+#%%
+import math
+import pandas as pd
 from strategies.base_strategy import BaseStrategy
-from config_loader import load_config
+from utils.config_loader import load_config
+from utils.data_factory import get_data
 
+#%%
 class IncomeStrategy(BaseStrategy):
+    """
+    Income Strategy — ASX XAO universe (XAO stocks not in XJO top 200),
+    biased toward dividend-paying stocks.
+
+    Max positions : 12
+    Sell (always) : current close ≤ 30-week rolling low             [Trend Stop]
+    Sell (index below SMA only):
+                    current close ≤ 30-week rolling low             [Trend Stop]
+                 OR current close ≤ 0.9 × 2-week high              [Momentum Stop]
+    Buy  (index above SMA, open slots exist):
+                    candidates supplied by external momentum scanner;
+                    sized at equal weight: portfolio_equity ÷ 12.
+
+    Symbol conversion: Trades sheet codes end in '.ASX'; stripped to base + '.au'
+    before calling get_data (e.g. 'ANZ.ASX' → 'ANZ.au').
+    """
+
+    MAX_POSITIONS       = 12
+    SELL_LOW_WEEKS      = 30
+    SELL_HIGH_WEEKS     = 2
+    SELL_HIGH_THRESHOLD = 0.9
+
     def __init__(self):
         config = load_config("config/income.json")
         super().__init__(config)
 
-    def market_traded_today(self):
-        # Implement actual logic using your data source
-        pass
+    #%%
+    def check_for_sell_orders(
+        self,
+        trades_df: pd.DataFrame,
+        _: pd.DataFrame,
+        index_above_ma: bool,
+        next_monday_str: str,
+    ) -> tuple:
+        """
+        Evaluate stop conditions for every currently Open position.
 
-    def update_last_price_for_positions(self):
-        pass
+        Trend Stop    : close ≤ 30-week rolling low (fires regardless of index state).
+        Momentum Stop : close ≤ 0.9 × 2-week high  (fires only when index is below SMA).
 
-    def update_distance_from_alert_price(self):
-        pass
+        Triggered rows are updated in-place:
+          Trade: → 'Sell'  |  Ex. Date: → next_monday_str
+          Ex. Price: / % chg: / Profit: / % Profit: → '-'
+        The actual exit price is filled by daily_workflow on next Monday's open.
 
-    def fill_sale_prices(self):
-        pass
+        Returns (updated_trades_df, sell_alerts_df).
+        """
+        asof      = self._asof_as_date()
+        min_bars  = self.SELL_LOW_WEEKS + 1
+        sell_rows = []
 
-    def subtract_commissions_from_sales(self):
-        pass
+        for idx, row in trades_df[trades_df['Trade:'] == 'Open'].iterrows():
+            code   = str(row['Code:'])
+            ticker = code.split('.')[0] + '.au'
 
-    def update_cash_balance_from_sales(self):
-        pass
+            try:
+                price_df = get_data(ticker, ed=asof, freq='W')
+                if price_df is None or len(price_df) < min_bars:
+                    continue
 
-    def fill_purchase_prices(self):
-        pass
+                current_close = float(price_df['Close'].iloc[-1])
+                n_week_low    = float(
+                    price_df['Low'].iloc[-(self.SELL_LOW_WEEKS + 1):-1].min()
+                )
+                two_week_high = float(
+                    price_df['High'].iloc[-self.SELL_HIGH_WEEKS:].max()
+                )
 
-    def update_cash_balance_from_purchases(self):
-        pass
+                trend_stop_hit    = current_close <= n_week_low
+                momentum_stop_hit = (not index_above_ma) and (
+                    current_close <= self.SELL_HIGH_THRESHOLD * two_week_high
+                )
 
-    def fill_buy_prices_for_recent_buys(self):
-        pass
+                if not (trend_stop_hit or momentum_stop_hit):
+                    continue
 
-    def update_equity_curve(self):
-        pass
+                stop_type = 'Trend Stop' if trend_stop_hit else 'Momentum Stop'
 
-    def update_fundamentals(self):
-        pass
+                trades_df.at[idx, 'Trade:']     = 'Sell'
+                trades_df.at[idx, 'Ex. Date:']  = next_monday_str
+                trades_df.at[idx, 'Ex. Price:'] = '-'
+                trades_df.at[idx, '% chg:']     = '-'
+                trades_df.at[idx, 'Profit:']    = '-'
+                trades_df.at[idx, '% Profit:']  = '-'
 
-    def update_prices_for_open_positions(self):
-        pass
+                sell_rows.append({
+                    'Code:':      code,
+                    'Action:':    'SELL',
+                    'Stop Type:': stop_type,
+                    'Date:':      next_monday_str,
+                })
 
-    def calc_recent_performance(self):
-        pass
+            except Exception:
+                continue
 
-    def update_open_positions_data(self):
-        pass
+        sell_alerts_df = (
+            pd.DataFrame(sell_rows)
+            if sell_rows
+            else pd.DataFrame(columns=['Code:', 'Action:', 'Stop Type:', 'Date:'])
+        )
+        return trades_df, sell_alerts_df
 
-    def calc_portfolio_stats(self):
-        pass
+    #%%
+    def check_for_buy_orders(
+        self,
+        trades_df: pd.DataFrame,
+        equity_df: pd.DataFrame,
+        index_above_ma: bool,
+        next_monday_str: str,
+    ) -> tuple:
+        """
+        Insert new Buy rows when the index filter is clear and the portfolio has capacity.
 
-    def check_for_sell_orders(self):
-        pass
+        Position size = floor(portfolio_equity / MAX_POSITIONS / current_weekly_close).
+        Occupied slots = count of rows where Trade: is 'Open' or 'Buy'.
 
-    def check_for_buy_orders(self):
-        pass
+        new_buys_df is the integration point for the external momentum scanner.
+        Replace the pd.DataFrame() placeholder with the ranked candidate list
+        (must contain at minimum a 'Code:' column) to activate live buy signals.
 
-    def calc_monthly_performance(self):
-        pass
+        Returns (updated_trades_df, buy_alerts_df).
+        """
+        empty_alerts = pd.DataFrame(columns=['Code:', 'Action:', 'Date:'])
 
-    def update_monthly_performance_tab(self):
-        pass
+        if not index_above_ma:
+            return trades_df, empty_alerts
 
-    def update_analytics(self):
-        pass
+        occupied        = int(trades_df['Trade:'].isin(['Open', 'Buy']).sum())
+        available_slots = self.MAX_POSITIONS - occupied
+        if available_slots <= 0:
+            return trades_df, empty_alerts
+
+        current_equity        = float(equity_df['Portfolio Equity:'].iloc[-1])
+        position_size_dollars = current_equity / self.MAX_POSITIONS
+
+        new_buys_df = pd.DataFrame()
+
+        if new_buys_df.empty:
+            return trades_df, empty_alerts
+
+        asof       = self._asof_as_date()
+        buy_rows   = []
+        alert_rows = []
+
+        for _, candidate in new_buys_df.head(available_slots).iterrows():
+            code   = str(candidate['Code:'])
+            ticker = code.split('.')[0] + '.au'
+
+            try:
+                price_df      = get_data(ticker, ed=asof, freq='W')
+                current_close = float(price_df['Close'].iloc[-1])
+                shares        = math.floor(position_size_dollars / current_close)
+                if shares == 0:
+                    continue
+
+                buy_rows.append({
+                    'Code:':      code,
+                    'Trade:':     'Buy',
+                    'Date:':      next_monday_str,
+                    'Price:':     '-',
+                    'Ex. Date:':  next_monday_str,
+                    'Ex. Price:': '-',
+                    '% chg:':     '-',
+                    'Profit:':    '-',
+                    '% Profit:':  '-',
+                    'Shares:':    float(shares),
+                })
+                alert_rows.append({
+                    'Code:':   code,
+                    'Action:': 'BUY',
+                    'Date:':   next_monday_str,
+                })
+
+            except Exception:
+                continue
+
+        if buy_rows:
+            trades_df = pd.concat(
+                [trades_df, pd.DataFrame(buy_rows)], ignore_index=True
+            )
+
+        buy_alerts_df = pd.DataFrame(alert_rows) if alert_rows else empty_alerts
+        return trades_df, buy_alerts_df

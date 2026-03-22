@@ -10,7 +10,10 @@ def update_market_performance(df, market_sym, end_date, freq):
     market_data = nd_timeseries(market_sym, freq, end_date)
     new_row = market_data.iloc[-1][['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Turnover']]
     
-    ret = new_row['Close'] / prev_equity
+    # Calculate percentage return of the index from the previous bar
+    prev_close = market_data.iloc[-2]['Close']
+    ret = new_row['Close'] / prev_close  # return multiplier (e.g. 1.01 = +1%)
+    # Apply that return to the previous equity to grow the equity curve
     new_row['Equity'] = prev_equity * ret
 
     df.loc[len(df)] = new_row

@@ -1,0 +1,16 @@
+{
+    "strategy_name": "income",
+    "universe": "XJO",
+    "benchmark": "^AXJO",
+    "frequency": "W",
+    "max_positions": 12,
+    "turnover_filter": 500000,
+    "volume_filter": 500000,
+    "index_filter_length": 15,
+    "high_window": 20,
+    "stop_window": 30,
+    "index_stop_lookback": 2,
+    "tight_stop_pct": 0.10,
+    "min_dividend_yield": 0.04,
+    "cash": 2000000
+}

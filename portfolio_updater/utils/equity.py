@@ -1,41 +1,30 @@
 import datetime
-from company_data import nd_timeseries
+from utils.company_data import nd_timeseries
 
-def get_equity_value(tradelist, cash, ed):
-
-    portfolio = tradelist[tradelist['Trade:']=='Open']['Code:'].to_list()
-    numshares = tradelist[tradelist['Trade:']=='Open']['Shares:'].to_list()
-
-    
-    equityvalue = 0
-    sd = datetime.datetime.now() - datetime.timedelta(days=2*365)
-    for s, n in zip(portfolio, numshares):
+def get_equity_value(trades_df, cash, target_date):
+    if trades_df.empty:
+        return cash
         
-        sym = f"{s[:3]}.au"
-        # if sym == "SUN.au":
-        #     sym ="SUNDD.au"
-        data = nd_timeseries(sym, sd, ed, 'W')
+    # Filter only open positions
+    open_positions = trades_df[trades_df['Trade:'] == 'Open']
+    if open_positions.empty:
+        return cash
+        
+    holdings_value = 0
+    for _, row in open_positions.iterrows():
+        sym = row['Code:']
+        # We look for price data
+        data = nd_timeseries(sym, target_date, 'D')
+        
+        # Check if data is empty (the 'armored' placeholder case)
+        if data is None or data.empty:
+            print(f"--- WARNING: No price data for {sym}, skipping in equity calculation ---")
+            continue
+            
         closeprice = data.iloc[-1]['Close']
-        value = closeprice * n
-        print(f"{sym}: {value}")
-        equityvalue += value
-    
-    # get values of sold positions
-    if tradelist[(tradelist['Ex. Price:'].isnull())&(tradelist['Trade:']=='Long')].empty:
-        pass
-    else:
-        for s in tradelist[tradelist['Ex. Price:'].isnull()]['Code:'].to_list():
-            sym = f"{s[:3]}.au"
-            data = nd_timeseries(sym, sd, ed, 'W')
-            openprice = data.iloc[-1]['Open']
-            value = openprice * tradelist[tradelist['Code:']==s]['Shares:'].values[0]
-            equityvalue += value
-            print(f"{sym}: {value}")
-
-    # add cash
-    equityvalue += cash
-
-    return equityvalue
+        holdings_value += (row['Shares:'] * closeprice)
+        
+    return holdings_value + cash
 
 def update_equity_curve(equitydf, equityvalue, d, cash):
 
