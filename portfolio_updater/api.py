@@ -148,24 +148,36 @@ def _build_kpis(
     equity_df:    pd.DataFrame,
     analytics_df: Optional[pd.DataFrame],
 ) -> dict:
-    numeric_equity = pd.to_numeric(
-        equity_df.get("Portfolio Equity:", pd.Series(dtype=float)),
-        errors="coerce",
-    )
-    clean = equity_df[numeric_equity.notna()].copy()
-    clean["_equity"] = numeric_equity[numeric_equity.notna()].values
+    empty_result = {"equity": 0.0, "cash": 0.0, "totalReturn": 0.0, "maxDrawdown": 0.0}
+
+    if equity_df.empty or "Portfolio Equity:" not in equity_df.columns:
+        return empty_result
+
+    numeric_equity = pd.to_numeric(equity_df["Portfolio Equity:"], errors="coerce")
+    valid_mask     = numeric_equity.notna()
+
+    if not valid_mask.any():
+        return empty_result
+
+    clean            = equity_df[valid_mask].copy()
+    clean["_equity"] = numeric_equity[valid_mask].values
 
     equity = float(clean["_equity"].iloc[-1])
-    cash   = _to_float(
-        pd.to_numeric(
-            clean.get("Cash:", pd.Series(dtype=float)), errors="coerce"
-        ).iloc[-1]
-    )
+
+    cash = 0.0
+    if "Cash:" in clean.columns:
+        cash_series = pd.to_numeric(clean["Cash:"], errors="coerce")
+        if not cash_series.empty and cash_series.notna().any():
+            cash = _to_float(cash_series.dropna().iloc[-1])
 
     total_return = 0.0
     max_drawdown = 0.0
 
-    if analytics_df is not None and not analytics_df.empty:
+    if (
+        analytics_df is not None
+        and not analytics_df.empty
+        and analytics_df.shape[1] >= 2
+    ):
         col_keys = analytics_df.iloc[:, 0].astype(str).str.lower().str.strip()
         col_vals = analytics_df.iloc[:, 1]
         metrics  = dict(zip(col_keys, col_vals))
@@ -194,16 +206,21 @@ def _build_kpis(
 
 
 def _build_equity_curve(equity_df: pd.DataFrame) -> list[dict]:
-    numeric_equity = pd.to_numeric(
-        equity_df.get("Portfolio Equity:", pd.Series(dtype=float)),
-        errors="coerce",
-    )
-    clean = equity_df[numeric_equity.notna()].copy()
-    clean["_equity"] = numeric_equity[numeric_equity.notna()].values
+    if equity_df.empty or "Portfolio Equity:" not in equity_df.columns:
+        return []
+
+    numeric_equity = pd.to_numeric(equity_df["Portfolio Equity:"], errors="coerce")
+    valid_mask     = numeric_equity.notna()
+
+    if not valid_mask.any():
+        return []
+
+    clean            = equity_df[valid_mask].copy()
+    clean["_equity"] = numeric_equity[valid_mask].values
 
     return [
         {
-            "date":  _fmt_date_short(row.get("Date:")),
+            "date":  _fmt_date_short(row.get("Date:", "")),
             "value": round(float(row["_equity"]), 2),
         }
         for _, row in clean.iterrows()
@@ -211,6 +228,9 @@ def _build_equity_curve(equity_df: pd.DataFrame) -> list[dict]:
 
 
 def _build_alerts(alerts_df: pd.DataFrame) -> list[dict]:
+    if alerts_df.empty or "Code:" not in alerts_df.columns:
+        return []
+
     result = []
     for _, row in alerts_df.iterrows():
         ticker = _to_str(row.get("Code:"))
@@ -221,7 +241,7 @@ def _build_alerts(alerts_df: pd.DataFrame) -> list[dict]:
         result.append({
             "ticker": ticker,
             "action": action,
-            "date":   _fmt_date(row.get("Date:")),
+            "date":   _fmt_date(row.get("Date:", "")),
             "reason": stop_type if stop_type else "Momentum Signal",
         })
     return result
@@ -231,8 +251,11 @@ def _build_positions(
     trades_df:  pd.DataFrame,
     company_df: Optional[pd.DataFrame],
 ) -> list[dict]:
+    if trades_df.empty or "Trade:" not in trades_df.columns:
+        return []
+
     company_lookup: dict[str, dict] = {}
-    if company_df is not None and not company_df.empty:
+    if company_df is not None and not company_df.empty and "Code:" in company_df.columns:
         for _, row in company_df.iterrows():
             code = _to_str(row.get("Code:"))
             if not code:
@@ -243,7 +266,7 @@ def _build_positions(
                 "currentPrice": _to_float(row.get("Last Price:")),
             }
 
-    trade_col = trades_df.get("Trade:", pd.Series(dtype=str)).astype(str).str.strip()
+    trade_col = trades_df["Trade:"].astype(str).str.strip()
     open_rows = trades_df[trade_col == "Open"]
 
     result = []
