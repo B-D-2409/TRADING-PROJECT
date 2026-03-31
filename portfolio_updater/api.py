@@ -1,3 +1,5 @@
+import asyncio
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -6,6 +8,7 @@ import pandas as pd
 import yfinance as yf
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 app = FastAPI(title="AusBiz Portfolio API", version="1.0.0")
 
@@ -438,6 +441,64 @@ def _build_positions(
         })
 
     return result
+
+
+VALID_STRATEGIES = {"all", "large_cap", "mid_cap", "income"}
+VALID_RUN_TYPES  = {"daily", "weekly", "monthly"}
+
+
+class EngineRunRequest(BaseModel):
+    strategy: str
+    run_type: str
+
+
+@app.post("/api/engine/run")
+async def run_engine(payload: EngineRunRequest):
+    if payload.strategy not in VALID_STRATEGIES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid strategy '{payload.strategy}'. Valid: {sorted(VALID_STRATEGIES)}",
+        )
+    if payload.run_type not in VALID_RUN_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid run_type '{payload.run_type}'. Valid: {sorted(VALID_RUN_TYPES)}",
+        )
+
+    script_path = BASE_DIR / "main.py"
+    run_flag    = f"--run-{payload.run_type}"
+    cmd         = [sys.executable, str(script_path), "--strategy", payload.strategy, run_flag]
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=str(BASE_DIR),
+        )
+        stdout, _ = await process.communicate()
+        output = stdout.decode("utf-8", errors="replace") if stdout else ""
+
+        if process.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail={"message": "Engine run failed — check the logs.", "output": output[-3000:]},
+            )
+
+        return {
+            "status":   "success",
+            "strategy": payload.strategy,
+            "run_type": payload.run_type,
+            "message":  f"Engine completed successfully · {payload.strategy} / {payload.run_type}",
+            "output":   output[-3000:],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={"message": str(exc), "output": ""},
+        )
 
 
 @app.get("/api/portfolio/{strategy}")

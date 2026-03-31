@@ -1,5 +1,6 @@
 import { Zap, RefreshCw, CircleDot } from 'lucide-react'
 import Button from '../common/Button'
+import EngineControl from './EngineControl'
 
 const STRATEGY_TABS = [
   { key: 'large_cap', label: 'Large Cap' },
@@ -61,6 +62,7 @@ export default function Header({
           <Button variant="ghost" size="sm" onClick={onRefresh} loading={loading}>
             <RefreshCw className="w-3.5 h-3.5" />
           </Button>
+          <EngineControl />
         </div>
 
       </div>
